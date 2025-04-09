@@ -18,7 +18,7 @@ public class KaspaPoolConfigExtra
     
     /// <summary>
     /// Arbitrary string added in the Kaspa coinbase tx
-    /// Default: "Miningcore.developers["Cedric CRISPIN"]"
+    /// Default: "Miningcore.developers["best2pool.com"]"
     /// </summary>
     public string ExtraData { get; set; }
     

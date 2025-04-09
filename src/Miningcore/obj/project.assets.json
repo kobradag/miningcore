@@ -6699,11 +6699,11 @@
   "project": {
     "version": "1.0.0",
     "restore": {
-      "projectUniqueName": "/root/cryptix-pool-miningcore/src/Miningcore/Miningcore.csproj",
+      "projectUniqueName": "/root/miningcore/src/Miningcore/Miningcore.csproj",
       "projectName": "Miningcore",
-      "projectPath": "/root/cryptix-pool-miningcore/src/Miningcore/Miningcore.csproj",
+      "projectPath": "/root/miningcore/src/Miningcore/Miningcore.csproj",
       "packagesPath": "/root/.nuget/packages/",
-      "outputPath": "/root/cryptix-pool-miningcore/src/Miningcore/obj/",
+      "outputPath": "/root/miningcore/src/Miningcore/obj/",
       "projectStyle": "PackageReference",
       "configFilePaths": [
         "/root/.nuget/NuGet/NuGet.Config"

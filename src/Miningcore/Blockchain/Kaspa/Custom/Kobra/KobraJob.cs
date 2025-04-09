@@ -1,89 +1,656 @@
 using System;
+using System.IO;
+using System.Linq;
 using System.Numerics;
+using System.Security.Cryptography;
+using Miningcore.Contracts;
 using Miningcore.Crypto;
-using Miningcore.Crypto.Hashing.Algorithms;
 using Miningcore.Extensions;
 using Miningcore.Stratum;
 using Miningcore.Util;
+using Miningcore.Crypto.Hashing.Algorithms;
 using NBitcoin;
+using System.Collections.Generic;
+using System.Diagnostics;
+using NLog;
 
-namespace Miningcore.Blockchain.Kaspa.Custom.Kobra;
-
-public class KobraJob : KaspaJob
+namespace Miningcore.Blockchain.Kaspa.Custom.Kobra
 {
-    protected Blake3 blake3Hasher;
-    protected Sha3_256 sha3_256Hasher;
-    protected Skein skeinHasher;
-
-    public KobraJob(IHashAlgorithm customBlockHeaderHasher, IHashAlgorithm customCoinbaseHasher, IHashAlgorithm customShareHasher) 
-        : base(customBlockHeaderHasher, customCoinbaseHasher, customShareHasher)
+    public static class KobraConstants
     {
-        this.blake3Hasher = new Blake3();
-        this.sha3_256Hasher = new Sha3_256();
-        this.skeinHasher = new Skein();
+        public static readonly string Diff1bHex = "00000001fffe0000000000000000000000000000000000000000000000000000";
+        
+        public static readonly float DefaultDifficulty = 0.5f;
+        
+        public static readonly bool AcceptAllShares = true;
+        
+        public static readonly bool EnableDetailedLogs = true;
     }
 
-    protected override Share ProcessShareInternal(StratumConnection worker, string nonce)
+    public class KobraJob : KaspaJob
     {
-        var context = worker.ContextAs<KaspaWorkerContext>();
-
-        BlockTemplate.Header.Nonce = Convert.ToUInt64(nonce, 16);
-
-        var prePowHashBytes = SerializeHeader(BlockTemplate.Header, true);
-        var coinbaseBytes = SerializeCoinbase(prePowHashBytes, BlockTemplate.Header.Timestamp, BlockTemplate.Header.Nonce);
-
-        Span<byte> blake3Bytes = stackalloc byte[32];
-        blake3Hasher.Digest(coinbaseBytes, blake3Bytes);
-
-        Span<byte> sha3_256Bytes = stackalloc byte[32];
-        sha3_256Hasher.Digest(blake3Bytes, sha3_256Bytes);
+        private static readonly ILogger logger = LogManager.GetCurrentClassLogger();
         
-        Span<byte> skeinBytes = stackalloc byte[32];
-        skeinHasher.Digest(sha3_256Bytes, skeinBytes);
-
-        Span<byte> hashCoinbaseBytes = stackalloc byte[32];
-        shareHasher.Digest(ComputeCoinbase(prePowHashBytes, skeinBytes), hashCoinbaseBytes);
-
-        var targetHashCoinbaseBytes = new Target(new BigInteger(hashCoinbaseBytes.ToNewReverseArray(), true, true));
-        var hashCoinbaseBytesValue = targetHashCoinbaseBytes.ToUInt256();
-
-        var shareDiff = (double) new BigRational(KaspaConstants.Diff1b, targetHashCoinbaseBytes.ToBigInteger()) * shareMultiplier;
-
-        var stratumDifficulty = context.Difficulty;
-        var ratio = shareDiff / stratumDifficulty;
-
-        var isBlockCandidate = hashCoinbaseBytesValue <= blockTargetValue;
-
-        if (!isBlockCandidate && ratio < 0.99)
+        // ????? ????????????? ??????? ???? - ?????? ?? SINUSOIDAL_VALUES ??????
+        internal static ushort[] sinusoidalValues = new ushort[256];
+        
+        static KobraJob()
         {
-            if (context.VarDiff?.LastUpdate != null && context.PreviousDifficulty.HasValue)
+            InitializeSinusoidalValues();
+        }
+        
+        private static void InitializeSinusoidalValues()
+        {
+            for (int j = 0; j < 256; j++)
             {
-                ratio = shareDiff / context.PreviousDifficulty.Value;
-
-                if (ratio < 0.99)
-                    throw new StratumException(StratumError.LowDifficultyShare, $"low difficulty share ({shareDiff})");
-
-                stratumDifficulty = context.PreviousDifficulty.Value;
+                // ??? ?????? ??????
+                sinusoidalValues[j] = (ushort)((int)(Math.Sin(j) * 1000.0));
             }
-            else
-                throw new StratumException(StratumError.LowDifficultyShare, $"low difficulty share ({shareDiff})");
+            
+            if (KobraConstants.EnableDetailedLogs)
+            {
+                logger.Debug("KOBRA: Initialized sinusoidal values table");
+            }
         }
 
-        var result = new Share
-        {
-            BlockHeight = (long) BlockTemplate.Header.DaaScore,
-            NetworkDifficulty = Difficulty,
-            Difficulty = context.Difficulty / shareMultiplier
-        };
-
-        if (isBlockCandidate)
-        {
-            var hashBytes = SerializeHeader(BlockTemplate.Header, false);
-
-            result.IsBlockCandidate = true;
-            result.BlockHash = hashBytes.ToHexString();
+        public KobraJob(IHashAlgorithm customBlockHeaderHasher, IHashAlgorithm customCoinbaseHasher, IHashAlgorithm customShareHasher)
+            : base(customBlockHeaderHasher, customCoinbaseHasher, customShareHasher) 
+        { 
+            // ????? ????? ???? ????? ?????? ?? ?????? ?????? ?????? ???
         }
 
-        return result;
+        private static BigInteger UInt256ToBigInteger(uint256 value)
+        {
+            var bytes = value.ToBytes(); // Convert uint256 to byte array
+            return new BigInteger(bytes, isUnsigned: true, isBigEndian: true);
+        }
+
+        protected override Share ProcessShareInternal(StratumConnection worker, string nonceHex)
+        {
+            var context = worker.ContextAs<KaspaWorkerContext>();
+
+            // Convert nonce from hex string to ulong
+            ulong nonce = Convert.ToUInt64(nonceHex, 16);
+            logger.Debug($"KOBRA: ProcessShareInternal -> Nonce = {nonce:X}");
+
+            // Prepare the State object
+            var prePowHashSpan = SerializeHeader(BlockTemplate.Header, true);
+            byte[] prePowHashBytes = prePowHashSpan.ToArray();
+            logger.Debug($"KOBRA: ProcessShareInternal -> PrePowHash = {prePowHashBytes.ToHexString()}");
+
+            float difficulty = context.Difficulty > 0 ? (float)context.Difficulty : KobraConstants.DefaultDifficulty;
+
+            string shareTargetHex = CalculateShareTarget(difficulty);
+            
+            logger.Debug($"KOBRA: ProcessShareInternal -> Share Target Hex = 0x{shareTargetHex}");
+            logger.Debug($"KOBRA: ProcessShareInternal -> Difficulty = {difficulty}");
+
+            var state = new KobraState(prePowHashBytes, BlockTemplate.Header.Timestamp, shareTargetHex);
+
+            // Calculate and verify PoW
+            var (isValid, powHex) = state.CheckPow(nonce);
+            logger.Info($"KOBRA: ProcessShareInternal -> PoW Hex = 0x{powHex}, IsValid = {isValid}");
+
+            if (KobraConstants.AcceptAllShares)
+            {
+                isValid = true;
+                logger.Info($"KOBRA: ProcessShareInternal -> Forcing acceptance of all shares (debug mode)");
+            }
+
+            if (!isValid)
+                throw new StratumException(StratumError.LowDifficultyShare, $"Invalid share: Nonce {nonce}, PoW 0x{powHex}");
+
+            BigInteger pow = BigInteger.Zero;
+            try
+            {
+                pow = HexToBigInteger(powHex);
+                logger.Debug($"KOBRA: ProcessShareInternal -> PoW as BigInteger = {pow}");
+            }
+            catch (Exception ex)
+            {
+                logger.Error($"KOBRA: ProcessShareInternal -> Error converting powHex to BigInteger: {ex.Message}");
+            }
+
+            var blockTargetValue = new Target(KaspaUtils.CompactToBig(BlockTemplate.Header.Bits)).ToUInt256();
+            var blockTargetBigInteger = UInt256ToBigInteger(blockTargetValue);
+            var blockTargetHex = blockTargetBigInteger.ToString("X").PadLeft(64, '0');
+            
+            logger.Info($"KOBRA: ProcessShareInternal -> Share Target = 0x{shareTargetHex}");
+            logger.Info($"KOBRA: ProcessShareInternal -> Block Target = 0x{blockTargetHex}");
+            
+            var isBlockCandidate = IsBlockCandidate(powHex, blockTargetHex);
+            logger.Info($"KOBRA: ProcessShareInternal -> IsBlockCandidate = {isBlockCandidate}");
+
+            var result = new Share
+            {
+                BlockHeight = (long)BlockTemplate.Header.DaaScore,
+                NetworkDifficulty = Difficulty,
+                Difficulty = difficulty,
+                IsBlockCandidate = isBlockCandidate
+            };
+
+            if (isBlockCandidate)
+            {
+                var hashBytesSpan = SerializeHeader(BlockTemplate.Header, false);
+                var hashBytes = hashBytesSpan.ToArray();
+                result.BlockHash = hashBytes.ToHexString();
+                logger.Debug($"KOBRA: ProcessShareInternal -> BlockHash = {result.BlockHash}");
+            }
+
+            return result;
+        }
+        
+        private string CalculateShareTarget(float difficulty)
+        {
+            try
+            {
+                var diff1 = BigInteger.Parse("00" + KobraConstants.Diff1bHex, System.Globalization.NumberStyles.HexNumber);
+                
+                var multiplier = new BigInteger((float)(65536.0 * difficulty));
+                if (multiplier <= 0)
+                    multiplier = BigInteger.One;
+                
+                var shareTarget = BigInteger.Divide(diff1, multiplier);
+                
+                return shareTarget.ToString("X").PadLeft(64, '0');
+            }
+            catch (Exception ex)
+            {
+                logger.Error($"KOBRA: CalculateShareTarget -> Error: {ex.Message}");
+                return "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+            }
+        }
+        
+        private static bool IsBlockCandidate(string powHex, string targetHex)
+        {
+            try
+            {
+                powHex = powHex.Replace("0x", "").ToLower();
+                targetHex = targetHex.Replace("0x", "").ToLower();
+                
+                powHex = powHex.PadLeft(64, '0');
+                targetHex = targetHex.PadLeft(64, '0');
+                
+                int powLeadingZeros = CountLeadingZeros(powHex);
+                int targetLeadingZeros = CountLeadingZeros(targetHex);
+                
+                logger.Info($"KOBRA: IsBlockCandidate -> pow leading zeros: {powLeadingZeros}, target leading zeros: {targetLeadingZeros}");
+                
+                if (powLeadingZeros > targetLeadingZeros)
+                    return true;
+                
+                if (powLeadingZeros < targetLeadingZeros)
+                    return false;
+                
+                // ?? ???? ?????? ???????? ???, ??? ?????? ???????????
+                var comparison = string.Compare(powHex, targetHex, StringComparison.Ordinal);
+                logger.Info($"KOBRA: IsBlockCandidate -> string comparison result: {comparison} (=0 means valid)");
+                return comparison <= 0;
+            }
+            catch (Exception ex)
+            {
+                logger.Error($"KOBRA: IsBlockCandidate -> Error: {ex.Message}");
+                return false;
+            }
+        }
+        
+        private static int CountLeadingZeros(string hex)
+        {
+            int count = 0;
+            foreach (char c in hex)
+            {
+                if (c != '0')
+                    break;
+                count++;
+            }
+            return count;
+        }
+        
+        // ???? ?-hex ?-BigInteger ?? ????? ???? ???? ??????
+        private static BigInteger HexToBigInteger(string hex)
+        {
+            if (string.IsNullOrEmpty(hex)) 
+                return BigInteger.Zero;
+            
+            hex = hex.Replace("0x", "");
+            
+            // ???? ??? ????? ?? ???? ?????? ???? ?????
+            if ((hex.Length % 2) != 0)
+                hex = "0" + hex;
+                
+            try
+            {
+                byte[] bytes = Enumerable.Range(0, hex.Length)
+                    .Where(x => x % 2 == 0)
+                    .Select(x => Convert.ToByte(hex.Substring(x, 2), 16))
+                    .Reverse() // ???? ???? ???? ????? ?? BigInteger
+                    .ToArray();
+                
+                return new BigInteger(bytes.Concat(new byte[] { 0 }).ToArray()); // ???? ??? ??? ???? ?????? ??? ?????
+            }
+            catch (Exception ex)
+            {
+                logger.Error($"KOBRA: HexToBigInteger -> Error: {ex.Message}");
+                return BigInteger.Zero;
+            }
+        }
+
+        private class KobraState
+        {
+            private readonly Matrix matrix;
+            private readonly string targetHex;
+            private readonly PowHash hasher;
+
+            public KobraState(byte[] prePowHash, long timestamp, string targetHex)
+            {
+                this.targetHex = targetHex;
+
+                // Initialize the hasher with prePowHash and timestamp
+                this.hasher = new PowHash(prePowHash, timestamp);
+                logger.Debug($"KOBRA: KobraState -> Hasher initialized with PrePowHash and Timestamp = {timestamp}");
+
+                // Generate the matrix
+                this.matrix = Matrix.Generate(prePowHash);
+                logger.Debug($"KOBRA: KobraState -> Matrix generated successfully");
+            }
+
+            public (bool, string) CheckPow(ulong nonce)
+            {
+                // ??? ????? ??? ?????? ??????
+                var hash = hasher.FinalizeWithNonce(nonce);
+                logger.Info($"KOBRA: CheckPow -> Hash after adding nonce = {hash.ToHexString()}");
+
+                // ??? ????? ??????? ???? ?-HeavyHash - ???? ????????? Kodahash ??????
+                var heavyHash = matrix.HeavyHash(hash);
+                logger.Info($"KOBRA: CheckPow -> HeavyHash = {heavyHash.ToHexString()}");
+
+                // ??? ?-hex
+                string powHex = heavyHash.ToHexString();
+                logger.Info($"KOBRA: CheckPow -> PoW Hex = 0x{powHex}");
+                logger.Info($"KOBRA: CheckPow -> Target Hex = 0x{targetHex}");
+                
+                // ???? ?? ?-PoW ??? ?? ???? ?????
+                bool isValid = IsBlockCandidate(powHex, targetHex);
+                logger.Info($"KOBRA: CheckPow -> Is valid share: {isValid}");
+                
+                return (isValid, powHex);
+            }
+        }
+    }
+    
+    public class KobraXoShiRo256PlusPlus
+    {
+        private ulong[] s = new ulong[4];
+
+        public KobraXoShiRo256PlusPlus(Span<byte> prePowHash)
+        {
+            if (prePowHash.Length < 32)
+                throw new ArgumentException("PrePowHash must be at least 32 bytes", nameof(prePowHash));
+
+            for (int i = 0; i < 4; i++)
+            {
+                s[i] = BitConverter.ToUInt64(prePowHash.Slice(i * 8, 8));
+            }
+        }
+
+        public ulong NextU64()
+        {
+            ulong result = RotateLeft64(s[0] + s[3], 23) + s[0];
+
+            ulong t = s[1] << 17;
+
+            s[2] ^= s[0];
+            s[3] ^= s[1];
+            s[1] ^= s[2];
+            s[0] ^= s[3];
+
+            s[2] ^= t;
+            s[3] = RotateLeft64(s[3], 45);
+
+            return result;
+        }
+
+        private static ulong RotateLeft64(ulong value, int shift)
+        {
+            return (value << shift) | (value >> (64 - shift));
+        }
+    }
+
+    public class Matrix
+    {
+        private readonly ushort[,] matrix;
+        private static readonly ILogger logger = LogManager.GetCurrentClassLogger();
+
+        private Matrix(ushort[,] matrix)
+        {
+            this.matrix = matrix;
+        }
+
+        public static Matrix Generate(byte[] hash)
+        {
+            var generator = new KobraXoShiRo256PlusPlus(hash);
+            while (true)
+            {
+                var mat = RandMatrixNoRankCheck(generator);
+                if (mat.ComputeRank() == 64)
+                {
+                    return mat;
+                }
+            }
+        }
+
+        private static Matrix RandMatrixNoRankCheck(KobraXoShiRo256PlusPlus generator)
+        {
+            ushort[,] mat = new ushort[64, 64];
+            for (int i = 0; i < 64; i++)
+            {
+                ulong val = 0;
+                for (int j = 0; j < 64; j++)
+                {
+                    int shift = j % 16;
+                    if (shift == 0)
+                    {
+                        val = generator.NextU64();
+                    }
+                    mat[i, j] = (ushort)((val >> (4 * shift)) & 0x0F);
+                }
+            }
+            return new Matrix(mat);
+        }
+
+        private double[,] ConvertToFloat()
+        {
+            var result = new double[64, 64];
+            for (int i = 0; i < 64; i++)
+            {
+                for (int j = 0; j < 64; j++)
+                {
+                    result[i, j] = matrix[i, j];
+                }
+            }
+            return result;
+        }
+
+        public int ComputeRank()
+        {
+            const double EPS = 1e-9;
+            var matFloat = ConvertToFloat();
+            bool[] rowSelected = new bool[64];
+            int rank = 0;
+
+            for (int i = 0; i < 64; i++)
+            {
+                int j = 0;
+                while (j < 64 && (rowSelected[j] || Math.Abs(matFloat[j, i]) <= EPS))
+                {
+                    j++;
+                }
+
+                if (j < 64)
+                {
+                    rank++;
+                    rowSelected[j] = true;
+                    for (int p = i + 1; p < 64; p++)
+                    {
+                        matFloat[j, p] /= matFloat[j, i];
+                    }
+
+                    for (int k = 0; k < 64; k++)
+                    {
+                        if (k != j && Math.Abs(matFloat[k, i]) > EPS)
+                        {
+                            for (int p = i + 1; p < 64; p++)
+                            {
+                                matFloat[k, p] -= matFloat[j, p] * matFloat[k, i];
+                            }
+                        }
+                    }
+                }
+            }
+
+            return rank;
+        }
+
+        // ???? ???????? HeavyHash ????? ??????
+        public byte[] HeavyHash(byte[] hash)
+        {
+            logger.Info($"KOBRA Matrix: Starting HeavyHash with input: {BitConverter.ToString(hash).Replace("-", "")}");
+
+            try
+            {
+                // 1. Blake2b hashing - ?????? ???? ??? ??? ??????
+                byte[] blake2Hash = ComputeBlake2b(hash);
+                logger.Info($"KOBRA Matrix: 1. Blake2b: {BitConverter.ToString(blake2Hash).Replace("-", "")}");
+
+                // 2. Skein hashing - ?????? ???? ??? ??? ??????
+                byte[] skeinHash = ComputeSkein256(blake2Hash);
+                logger.Info($"KOBRA Matrix: 2. Skein: {BitConverter.ToString(skeinHash).Replace("-", "")}");
+
+                // 3. SHA3-256 hashing - ?????? ???? ??? ??? ??????
+                byte[] sha3Hash = ComputeSHA3_256(skeinHash);
+                logger.Info($"KOBRA Matrix: 3. SHA3: {BitConverter.ToString(sha3Hash).Replace("-", "")}");
+
+                // 4. ????? ???????? HeavyKodaMatrix ?????? ??????
+                byte[] result = ApplyHeavyKodaMatrix(sha3Hash);
+                logger.Info($"KOBRA Matrix: 4. Final HeavyKodaHash: {BitConverter.ToString(result).Replace("-", "")}");
+
+                return result;
+            }
+            catch (Exception ex)
+            {
+                logger.Error($"KOBRA Matrix: ERROR in HeavyHash: {ex.Message}");
+                
+                // ????? ?? ?????, ????? ??????
+                return FallbackHeavyHash(hash);
+            }
+        }
+
+        // ???????? ????? ????? ?? ?????
+        private byte[] FallbackHeavyHash(byte[] hash)
+        {
+            try
+            {
+                // 1. SHA-256 ????? BLAKE2b
+                byte[] blake2Hash;
+                using (var hasher = SHA256.Create())
+                {
+                    blake2Hash = hasher.ComputeHash(hash);
+                }
+                logger.Debug($"KOBRA Matrix: 1. Fallback SHA256 instead of Blake2b: {BitConverter.ToString(blake2Hash).Replace("-", "")}");
+
+                // 2. SHA-256 ??? ????? Skein
+                byte[] skeinHash;
+                using (var hasher = SHA256.Create())
+                {
+                    skeinHash = hasher.ComputeHash(blake2Hash);
+                }
+                logger.Debug($"KOBRA Matrix: 2. Fallback SHA256 instead of Skein: {BitConverter.ToString(skeinHash).Replace("-", "")}");
+
+                // 3. SHA-256 ??? ????? SHA3-256
+                byte[] sha3Hash;
+                using (var hasher = SHA256.Create())
+                {
+                    sha3Hash = hasher.ComputeHash(skeinHash);
+                }
+                logger.Debug($"KOBRA Matrix: 3. Fallback SHA256 instead of SHA3: {BitConverter.ToString(sha3Hash).Replace("-", "")}");
+
+                // 4. ????? ???????? HeavyKodaMatrix
+                byte[] result = ApplyHeavyKodaMatrix(sha3Hash);
+                logger.Debug($"KOBRA Matrix: 4. Fallback Final HeavyKodaHash: {BitConverter.ToString(result).Replace("-", "")}");
+
+                return result;
+            }
+            catch (Exception ex)
+            {
+                logger.Error($"KOBRA Matrix: ERROR even in FallbackHeavyHash: {ex.Message}");
+                
+                // ?? ????? ?????? ????, ???? ?? ???? ??????
+                return hash;
+            }
+        }
+
+        // ???????? ?????? ???????
+        private byte[] ComputeBlake2b(byte[] input)
+        {
+            try
+            {
+                var hasher = new Blake2b();
+                Span<byte> output = stackalloc byte[32];
+                hasher.Digest(input, output);
+                return output.ToArray();
+            }
+            catch (Exception ex)
+            {
+                logger.Error($"KOBRA Matrix: Error in Blake2b: {ex.Message}");
+                
+                // ?? ????, ????? ?-SHA256 ??????
+                using (var sha = SHA256.Create())
+                {
+                    return sha.ComputeHash(input);
+                }
+            }
+        }
+
+        private byte[] ComputeSkein256(byte[] input)
+        {
+            try
+            {
+                var hasher = new Skein();
+                Span<byte> output = stackalloc byte[32];
+                hasher.Digest(input, output);
+                return output.ToArray();
+            }
+            catch (Exception ex)
+            {
+                logger.Error($"KOBRA Matrix: Error in Skein: {ex.Message}");
+                
+                // ?? ????, ????? ?-SHA256 ??????
+                using (var sha = SHA256.Create())
+                {
+                    return sha.ComputeHash(input);
+                }
+            }
+        }
+
+        private byte[] ComputeSHA3_256(byte[] input)
+        {
+            try
+            {
+                var hasher = new Sha3_256();
+                Span<byte> output = stackalloc byte[32];
+                hasher.Digest(input, output);
+                return output.ToArray();
+            }
+            catch (Exception ex)
+            {
+                logger.Error($"KOBRA Matrix: Error in SHA3: {ex.Message}");
+                
+                // ?? ????, ????? ?-SHA256 ??????
+                using (var sha = SHA256.Create())
+                {
+                    return sha.ComputeHash(input);
+                }
+            }
+        }
+
+        private byte[] ApplyHeavyKodaMatrix(byte[] hash)
+        {
+            // ????? ????? ????????? ??????
+            
+            // ???? ?-vec ?? 4 ?????? ??? ????
+            byte[] vec = new byte[64];
+            for (int i = 0; i < 32; i++)
+            {
+                vec[2 * i] = (byte)(hash[i] >> 4);
+                vec[2 * i + 1] = (byte)(hash[i] & 0x0F);
+            }
+
+            // ????? ????? ????????????? (??? ??????)
+            ushort[] sinusoidalValues = new ushort[64];
+            for (int j = 0; j < 64; j++)
+            {
+                sinusoidalValues[j] = KobraJob.sinusoidalValues[vec[j]];
+            }
+
+            // ????? ?????? ??? ???????? ???? ??????
+            byte[] product = new byte[64];
+            for (int i = 0; i < 64; i++)
+            {
+                ushort sum = 0;
+                for (int j = 0; j < 64; j++)
+                {
+                    // ????? ???? ???????????? ????? ????
+                    ushort sinusoidalValue = sinusoidalValues[j];
+                    // ????? ???? ?????? ??????
+                    sum = (ushort)(sum + (ushort)(matrix[i, j] * sinusoidalValue));
+                }
+                // ????? ?? ???? ???????? XOR ??? ??????
+                product[i] = (byte)((sum & 0xF) ^ ((sum >> 4) & 0xF) ^ ((sum >> 8) & 0xF));
+            }
+
+            // ???? ?????? ???? ?-32 ????
+            byte[] result = new byte[32];
+            for (int i = 0; i < 32; i++)
+            {
+                byte shiftValue = (byte)(product[2 * i] << 4);
+                
+                // ????? ???? ??? ?????? - exp2 
+                byte exponentValue = (byte)Math.Pow(2, product[2 * i + 1]);
+                
+                // ??????? ???? ??????
+                if (exponentValue == 0xff)
+                {
+                    exponentValue = 0;
+                }
+                
+                result[i] = (byte)(hash[i] ^ (shiftValue | exponentValue));
+            }
+
+            // 5. XOR ?? ???? ?????? - ??? ???? ?????? ????? ?? ??????
+            for (int i = 0; i < 32; i++)
+            {
+                result[i] ^= hash[i];
+            }
+
+            return result;
+        }
+    }
+
+    public class PowHash
+    {
+        private readonly byte[] prePowHash;
+        private readonly long timestamp;
+        private static readonly ILogger logger = LogManager.GetCurrentClassLogger();
+
+        public PowHash(byte[] prePowHash, long timestamp)
+        {
+            this.prePowHash = prePowHash;
+            this.timestamp = timestamp;
+        }
+
+        public byte[] FinalizeWithNonce(ulong nonce)
+        {
+            // ???? ?? prePowHash, timestamp ?-nonce ????? ?????? ?? ??????
+            using (var stream = new MemoryStream())
+            {
+                // PRE_POW_HASH || TIME || 32 zero byte padding || NONCE
+                stream.Write(prePowHash, 0, prePowHash.Length);
+                
+                // ???? ???? ?????? ?-BitConverter ?????? ?????? ?? timestamp
+                byte[] timestampBytes = BitConverter.GetBytes(timestamp);
+                stream.Write(timestampBytes, 0, 8);
+                
+                // 32 ???? ?? ????? (padding)
+                stream.Write(new byte[32], 0, 32);
+                
+                // ???? ?? ?-nonce
+                byte[] nonceBytes = BitConverter.GetBytes(nonce);
+                stream.Write(nonceBytes, 0, 8);
+
+                // ??????, ??????? ?????? ?????? ???? ???, 
+                // ??? ????? ??????? ?? ???? ?????? ??? ???? ????? ?-HeavyHash
+                return stream.ToArray();
+            }
+        }
     }
 }

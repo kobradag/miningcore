@@ -1,8 +1,8 @@
 {
   "version": 2,
-  "dgSpecHash": "cZzgzRVL/7DB6wV5DH5Z7cRUngnkD7hN6i5/Ro91oPGjMxschesUud1Z+M0YnS5Z3LeOEpKnCbeen8+x2UY15g==",
+  "dgSpecHash": "kZ4n2Fh5FZkA9WCk981IuOpHpptf+jV9rAX4b1e4fOAbfPoWqO0oUSP4EyCz/J9FINqB7FL3f9fdoOBbeUuJzw==",
   "success": true,
-  "projectFilePath": "/root/cryptix-pool-miningcore/src/Miningcore/Miningcore.csproj",
+  "projectFilePath": "/root/miningcore/src/Miningcore/Miningcore.csproj",
   "expectedPackageFiles": [
     "/root/.nuget/packages/aspnetcoreratelimit/5.0.0/aspnetcoreratelimit.5.0.0.nupkg.sha512",
     "/root/.nuget/packages/autofac/8.0.0/autofac.8.0.0.nupkg.sha512",
