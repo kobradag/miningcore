@@ -22,7 +22,7 @@ namespace Miningcore.Blockchain.Kaspa.Custom.Kobra
         
         public static readonly float DefaultDifficulty = 0.5f;
         
-        public static readonly bool AcceptAllShares = true;
+        public static readonly bool AcceptAllShares = false;
         
         public static readonly bool EnableDetailedLogs = true;
     }
@@ -31,7 +31,6 @@ namespace Miningcore.Blockchain.Kaspa.Custom.Kobra
     {
         private static readonly ILogger logger = LogManager.GetCurrentClassLogger();
         
-        // ????? ????????????? ??????? ???? - ?????? ?? SINUSOIDAL_VALUES ??????
         internal static ushort[] sinusoidalValues = new ushort[256];
         
         static KobraJob()
@@ -43,8 +42,8 @@ namespace Miningcore.Blockchain.Kaspa.Custom.Kobra
         {
             for (int j = 0; j < 256; j++)
             {
-                // ??? ?????? ??????
-                sinusoidalValues[j] = (ushort)((int)(Math.Sin(j) * 1000.0));
+            double angle = (double)j; 
+            sinusoidalValues[j] = (ushort)(Math.Abs(Math.Sin(angle)) * 1000.0);
             }
             
             if (KobraConstants.EnableDetailedLogs)
@@ -56,7 +55,7 @@ namespace Miningcore.Blockchain.Kaspa.Custom.Kobra
         public KobraJob(IHashAlgorithm customBlockHeaderHasher, IHashAlgorithm customCoinbaseHasher, IHashAlgorithm customShareHasher)
             : base(customBlockHeaderHasher, customCoinbaseHasher, customShareHasher) 
         { 
-            // ????? ????? ???? ????? ?????? ?? ?????? ?????? ?????? ???
+
         }
 
         private static BigInteger UInt256ToBigInteger(uint256 value)
@@ -98,7 +97,17 @@ namespace Miningcore.Blockchain.Kaspa.Custom.Kobra
             }
 
             if (!isValid)
-                throw new StratumException(StratumError.LowDifficultyShare, $"Invalid share: Nonce {nonce}, PoW 0x{powHex}");
+            {
+              logger.Warn($"KOBRA: Invalid share from worker {worker.ConnectionId} - Nonce: {nonce}, PoW: 0x{powHex}");
+
+              return new Share
+            {
+                 BlockHeight = (long)BlockTemplate.Header.DaaScore,
+                 NetworkDifficulty = Difficulty,
+                 Difficulty = difficulty,
+                 IsBlockCandidate = false
+                 };
+            }
 
             BigInteger pow = BigInteger.Zero;
             try
@@ -163,50 +172,21 @@ namespace Miningcore.Blockchain.Kaspa.Custom.Kobra
         
         private static bool IsBlockCandidate(string powHex, string targetHex)
         {
-            try
-            {
-                powHex = powHex.Replace("0x", "").ToLower();
-                targetHex = targetHex.Replace("0x", "").ToLower();
-                
-                powHex = powHex.PadLeft(64, '0');
-                targetHex = targetHex.PadLeft(64, '0');
-                
-                int powLeadingZeros = CountLeadingZeros(powHex);
-                int targetLeadingZeros = CountLeadingZeros(targetHex);
-                
-                logger.Info($"KOBRA: IsBlockCandidate -> pow leading zeros: {powLeadingZeros}, target leading zeros: {targetLeadingZeros}");
-                
-                if (powLeadingZeros > targetLeadingZeros)
-                    return true;
-                
-                if (powLeadingZeros < targetLeadingZeros)
-                    return false;
-                
-                // ?? ???? ?????? ???????? ???, ??? ?????? ???????????
-                var comparison = string.Compare(powHex, targetHex, StringComparison.Ordinal);
-                logger.Info($"KOBRA: IsBlockCandidate -> string comparison result: {comparison} (=0 means valid)");
-                return comparison <= 0;
-            }
-            catch (Exception ex)
-            {
-                logger.Error($"KOBRA: IsBlockCandidate -> Error: {ex.Message}");
-                return false;
-            }
+          try
+          {
+          var pow = HexToBigInteger(powHex);
+          var target = HexToBigInteger(targetHex);
+          return pow <= target;
         }
-        
-        private static int CountLeadingZeros(string hex)
+        catch (Exception ex)
         {
-            int count = 0;
-            foreach (char c in hex)
-            {
-                if (c != '0')
-                    break;
-                count++;
-            }
-            return count;
+             logger.Error($"KOBRA: IsBlockCandidate -> Error: {ex.Message}");
+             return false;
+           }
         }
+
+       
         
-        // ???? ?-hex ?-BigInteger ?? ????? ???? ???? ??????
         private static BigInteger HexToBigInteger(string hex)
         {
             if (string.IsNullOrEmpty(hex)) 
@@ -214,7 +194,6 @@ namespace Miningcore.Blockchain.Kaspa.Custom.Kobra
             
             hex = hex.Replace("0x", "");
             
-            // ???? ??? ????? ?? ???? ?????? ???? ?????
             if ((hex.Length % 2) != 0)
                 hex = "0" + hex;
                 
@@ -223,8 +202,7 @@ namespace Miningcore.Blockchain.Kaspa.Custom.Kobra
                 byte[] bytes = Enumerable.Range(0, hex.Length)
                     .Where(x => x % 2 == 0)
                     .Select(x => Convert.ToByte(hex.Substring(x, 2), 16))
-                    .Reverse() // ???? ???? ???? ????? ?? BigInteger
-                    .ToArray();
+                    .Reverse()                     .ToArray();
                 
                 return new BigInteger(bytes.Concat(new byte[] { 0 }).ToArray()); // ???? ??? ??? ???? ?????? ??? ?????
             }
@@ -256,20 +234,16 @@ namespace Miningcore.Blockchain.Kaspa.Custom.Kobra
 
             public (bool, string) CheckPow(ulong nonce)
             {
-                // ??? ????? ??? ?????? ??????
                 var hash = hasher.FinalizeWithNonce(nonce);
                 logger.Info($"KOBRA: CheckPow -> Hash after adding nonce = {hash.ToHexString()}");
 
-                // ??? ????? ??????? ???? ?-HeavyHash - ???? ????????? Kodahash ??????
                 var heavyHash = matrix.HeavyHash(hash);
                 logger.Info($"KOBRA: CheckPow -> HeavyHash = {heavyHash.ToHexString()}");
 
-                // ??? ?-hex
                 string powHex = heavyHash.ToHexString();
                 logger.Info($"KOBRA: CheckPow -> PoW Hex = 0x{powHex}");
                 logger.Info($"KOBRA: CheckPow -> Target Hex = 0x{targetHex}");
                 
-                // ???? ?? ?-PoW ??? ?? ???? ?????
                 bool isValid = IsBlockCandidate(powHex, targetHex);
                 logger.Info($"KOBRA: CheckPow -> Is valid share: {isValid}");
                 
@@ -314,10 +288,9 @@ namespace Miningcore.Blockchain.Kaspa.Custom.Kobra
         {
             return (value << shift) | (value >> (64 - shift));
         }
-    }
 
-    public class Matrix
-    {
+        public class Matrix
+        {
         private readonly ushort[,] matrix;
         private static readonly ILogger logger = LogManager.GetCurrentClassLogger();
 
@@ -411,26 +384,21 @@ namespace Miningcore.Blockchain.Kaspa.Custom.Kobra
             return rank;
         }
 
-        // ???? ???????? HeavyHash ????? ??????
         public byte[] HeavyHash(byte[] hash)
         {
             logger.Info($"KOBRA Matrix: Starting HeavyHash with input: {BitConverter.ToString(hash).Replace("-", "")}");
 
             try
             {
-                // 1. Blake2b hashing - ?????? ???? ??? ??? ??????
                 byte[] blake2Hash = ComputeBlake2b(hash);
                 logger.Info($"KOBRA Matrix: 1. Blake2b: {BitConverter.ToString(blake2Hash).Replace("-", "")}");
 
-                // 2. Skein hashing - ?????? ???? ??? ??? ??????
                 byte[] skeinHash = ComputeSkein256(blake2Hash);
                 logger.Info($"KOBRA Matrix: 2. Skein: {BitConverter.ToString(skeinHash).Replace("-", "")}");
 
-                // 3. SHA3-256 hashing - ?????? ???? ??? ??? ??????
                 byte[] sha3Hash = ComputeSHA3_256(skeinHash);
                 logger.Info($"KOBRA Matrix: 3. SHA3: {BitConverter.ToString(sha3Hash).Replace("-", "")}");
 
-                // 4. ????? ???????? HeavyKodaMatrix ?????? ??????
                 byte[] result = ApplyHeavyKodaMatrix(sha3Hash);
                 logger.Info($"KOBRA Matrix: 4. Final HeavyKodaHash: {BitConverter.ToString(result).Replace("-", "")}");
 
@@ -440,12 +408,10 @@ namespace Miningcore.Blockchain.Kaspa.Custom.Kobra
             {
                 logger.Error($"KOBRA Matrix: ERROR in HeavyHash: {ex.Message}");
                 
-                // ????? ?? ?????, ????? ??????
                 return FallbackHeavyHash(hash);
             }
         }
 
-        // ???????? ????? ????? ?? ?????
         private byte[] FallbackHeavyHash(byte[] hash)
         {
             try
@@ -458,7 +424,6 @@ namespace Miningcore.Blockchain.Kaspa.Custom.Kobra
                 }
                 logger.Debug($"KOBRA Matrix: 1. Fallback SHA256 instead of Blake2b: {BitConverter.ToString(blake2Hash).Replace("-", "")}");
 
-                // 2. SHA-256 ??? ????? Skein
                 byte[] skeinHash;
                 using (var hasher = SHA256.Create())
                 {
@@ -466,7 +431,6 @@ namespace Miningcore.Blockchain.Kaspa.Custom.Kobra
                 }
                 logger.Debug($"KOBRA Matrix: 2. Fallback SHA256 instead of Skein: {BitConverter.ToString(skeinHash).Replace("-", "")}");
 
-                // 3. SHA-256 ??? ????? SHA3-256
                 byte[] sha3Hash;
                 using (var hasher = SHA256.Create())
                 {
@@ -474,7 +438,6 @@ namespace Miningcore.Blockchain.Kaspa.Custom.Kobra
                 }
                 logger.Debug($"KOBRA Matrix: 3. Fallback SHA256 instead of SHA3: {BitConverter.ToString(sha3Hash).Replace("-", "")}");
 
-                // 4. ????? ???????? HeavyKodaMatrix
                 byte[] result = ApplyHeavyKodaMatrix(sha3Hash);
                 logger.Debug($"KOBRA Matrix: 4. Fallback Final HeavyKodaHash: {BitConverter.ToString(result).Replace("-", "")}");
 
@@ -484,12 +447,10 @@ namespace Miningcore.Blockchain.Kaspa.Custom.Kobra
             {
                 logger.Error($"KOBRA Matrix: ERROR even in FallbackHeavyHash: {ex.Message}");
                 
-                // ?? ????? ?????? ????, ???? ?? ???? ??????
                 return hash;
             }
         }
 
-        // ???????? ?????? ???????
         private byte[] ComputeBlake2b(byte[] input)
         {
             try
@@ -503,7 +464,6 @@ namespace Miningcore.Blockchain.Kaspa.Custom.Kobra
             {
                 logger.Error($"KOBRA Matrix: Error in Blake2b: {ex.Message}");
                 
-                // ?? ????, ????? ?-SHA256 ??????
                 using (var sha = SHA256.Create())
                 {
                     return sha.ComputeHash(input);
@@ -524,7 +484,6 @@ namespace Miningcore.Blockchain.Kaspa.Custom.Kobra
             {
                 logger.Error($"KOBRA Matrix: Error in Skein: {ex.Message}");
                 
-                // ?? ????, ????? ?-SHA256 ??????
                 using (var sha = SHA256.Create())
                 {
                     return sha.ComputeHash(input);
@@ -545,7 +504,6 @@ namespace Miningcore.Blockchain.Kaspa.Custom.Kobra
             {
                 logger.Error($"KOBRA Matrix: Error in SHA3: {ex.Message}");
                 
-                // ?? ????, ????? ?-SHA256 ??????
                 using (var sha = SHA256.Create())
                 {
                     return sha.ComputeHash(input);
@@ -555,9 +513,7 @@ namespace Miningcore.Blockchain.Kaspa.Custom.Kobra
 
         private byte[] ApplyHeavyKodaMatrix(byte[] hash)
         {
-            // ????? ????? ????????? ??????
             
-            // ???? ?-vec ?? 4 ?????? ??? ????
             byte[] vec = new byte[64];
             for (int i = 0; i < 32; i++)
             {
@@ -565,39 +521,31 @@ namespace Miningcore.Blockchain.Kaspa.Custom.Kobra
                 vec[2 * i + 1] = (byte)(hash[i] & 0x0F);
             }
 
-            // ????? ????? ????????????? (??? ??????)
             ushort[] sinusoidalValues = new ushort[64];
             for (int j = 0; j < 64; j++)
             {
                 sinusoidalValues[j] = KobraJob.sinusoidalValues[vec[j]];
             }
 
-            // ????? ?????? ??? ???????? ???? ??????
             byte[] product = new byte[64];
             for (int i = 0; i < 64; i++)
             {
                 ushort sum = 0;
                 for (int j = 0; j < 64; j++)
                 {
-                    // ????? ???? ???????????? ????? ????
                     ushort sinusoidalValue = sinusoidalValues[j];
-                    // ????? ???? ?????? ??????
                     sum = (ushort)(sum + (ushort)(matrix[i, j] * sinusoidalValue));
                 }
-                // ????? ?? ???? ???????? XOR ??? ??????
                 product[i] = (byte)((sum & 0xF) ^ ((sum >> 4) & 0xF) ^ ((sum >> 8) & 0xF));
             }
 
-            // ???? ?????? ???? ?-32 ????
             byte[] result = new byte[32];
             for (int i = 0; i < 32; i++)
             {
                 byte shiftValue = (byte)(product[2 * i] << 4);
                 
-                // ????? ???? ??? ?????? - exp2 
                 byte exponentValue = (byte)Math.Pow(2, product[2 * i + 1]);
                 
-                // ??????? ???? ??????
                 if (exponentValue == 0xff)
                 {
                     exponentValue = 0;
@@ -606,7 +554,6 @@ namespace Miningcore.Blockchain.Kaspa.Custom.Kobra
                 result[i] = (byte)(hash[i] ^ (shiftValue | exponentValue));
             }
 
-            // 5. XOR ?? ???? ?????? - ??? ???? ?????? ????? ?? ??????
             for (int i = 0; i < 32; i++)
             {
                 result[i] ^= hash[i];
@@ -630,25 +577,18 @@ namespace Miningcore.Blockchain.Kaspa.Custom.Kobra
 
         public byte[] FinalizeWithNonce(ulong nonce)
         {
-            // ???? ?? prePowHash, timestamp ?-nonce ????? ?????? ?? ??????
             using (var stream = new MemoryStream())
             {
-                // PRE_POW_HASH || TIME || 32 zero byte padding || NONCE
                 stream.Write(prePowHash, 0, prePowHash.Length);
                 
-                // ???? ???? ?????? ?-BitConverter ?????? ?????? ?? timestamp
                 byte[] timestampBytes = BitConverter.GetBytes(timestamp);
                 stream.Write(timestampBytes, 0, 8);
                 
-                // 32 ???? ?? ????? (padding)
                 stream.Write(new byte[32], 0, 32);
                 
-                // ???? ?? ?-nonce
                 byte[] nonceBytes = BitConverter.GetBytes(nonce);
                 stream.Write(nonceBytes, 0, 8);
 
-                // ??????, ??????? ?????? ?????? ???? ???, 
-                // ??? ????? ??????? ?? ???? ?????? ??? ???? ????? ?-HeavyHash
                 return stream.ToArray();
             }
         }
