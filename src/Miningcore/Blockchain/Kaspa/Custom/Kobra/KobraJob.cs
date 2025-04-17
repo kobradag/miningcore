@@ -215,41 +215,42 @@ namespace Miningcore.Blockchain.Kaspa.Custom.Kobra
 
         private class KobraState
         {
-            private readonly Matrix matrix;
-            private readonly string targetHex;
-            private readonly PowHash hasher;
+           private readonly KobraXoShiRo256PlusPlus.Matrix matrix;
+           private readonly string targetHex;
+           private readonly KobraXoShiRo256PlusPlus.PowHash hasher;
 
-            public KobraState(byte[] prePowHash, long timestamp, string targetHex)
-            {
-                this.targetHex = targetHex;
+           public KobraState(byte[] prePowHash, long timestamp, string targetHex)
+           {
+              this.targetHex = targetHex;
 
-                // Initialize the hasher with prePowHash and timestamp
-                this.hasher = new PowHash(prePowHash, timestamp);
-                logger.Debug($"KOBRA: KobraState -> Hasher initialized with PrePowHash and Timestamp = {timestamp}");
+               // Initialize the hasher with prePowHash and timestamp
+               this.hasher = new KobraXoShiRo256PlusPlus.PowHash(prePowHash, timestamp);
+               logger.Debug($"KOBRA: KobraState -> Hasher initialized with PrePowHash and Timestamp = {timestamp}");
+ 
+               // Generate the matrix
+               this.matrix = KobraXoShiRo256PlusPlus.Matrix.Generate(prePowHash);
+               logger.Debug($"KOBRA: KobraState -> Matrix generated successfully");
+          }
 
-                // Generate the matrix
-                this.matrix = Matrix.Generate(prePowHash);
-                logger.Debug($"KOBRA: KobraState -> Matrix generated successfully");
-            }
+          public (bool, string) CheckPow(ulong nonce)
+          {
+              var hash = hasher.FinalizeWithNonce(nonce);
+              logger.Info($"KOBRA: CheckPow -> Hash after adding nonce = {hash.ToHexString()}");
 
-            public (bool, string) CheckPow(ulong nonce)
-            {
-                var hash = hasher.FinalizeWithNonce(nonce);
-                logger.Info($"KOBRA: CheckPow -> Hash after adding nonce = {hash.ToHexString()}");
+              var heavyHash = matrix.HeavyHash(hash);
+              logger.Info($"KOBRA: CheckPow -> HeavyHash = {heavyHash.ToHexString()}");
 
-                var heavyHash = matrix.HeavyHash(hash);
-                logger.Info($"KOBRA: CheckPow -> HeavyHash = {heavyHash.ToHexString()}");
+              string powHex = heavyHash.ToHexString();
+              logger.Info($"KOBRA: CheckPow -> PoW Hex = 0x{powHex}");
+              logger.Info($"KOBRA: CheckPow -> Target Hex = 0x{targetHex}");
 
-                string powHex = heavyHash.ToHexString();
-                logger.Info($"KOBRA: CheckPow -> PoW Hex = 0x{powHex}");
-                logger.Info($"KOBRA: CheckPow -> Target Hex = 0x{targetHex}");
-                
-                bool isValid = IsBlockCandidate(powHex, targetHex);
-                logger.Info($"KOBRA: CheckPow -> Is valid share: {isValid}");
-                
-                return (isValid, powHex);
-            }
-        }
+              bool isValid = IsBlockCandidate(powHex, targetHex);
+              logger.Info($"KOBRA: CheckPow -> Is valid share: {isValid}");
+
+              return (isValid, powHex);
+          }
+       }
+
     }
     
     public class KobraXoShiRo256PlusPlus
@@ -593,4 +594,5 @@ namespace Miningcore.Blockchain.Kaspa.Custom.Kobra
             }
         }
     }
+}
 }
